@@ -117,10 +117,10 @@ async function probeCheckoutModification(pspRef, apiKey, prefix, merchant) {
   return result;
 }
 
-// ── PROBE 2: PAL v68 /payments/{pspRef}/reversals ────────────────────────────
-// Stesso principio: 422 con messaggio specifico dice se il pspRef esiste
+// ── PROBE 2: Checkout live /payments/{pspRef}/reversals ──────────────────────
+// URL corretto: checkout-live hostname, non pal-live
 async function probePALReversal(pspRef, apiKey, prefix, merchant) {
-  const url = `https://${prefix}-pal-live.adyenpayments.com/pal/servlet/Checkout/v71/payments/${pspRef}/reversals`;
+  const url = `https://${prefix}-checkout-live.adyenpayments.com/checkout/v71/payments/${pspRef}/reversals`;
   const body = {
     merchantAccount: merchant,
     reference: "STATUS_PROBE_DO_NOT_PROCESS",
@@ -129,7 +129,7 @@ async function probePALReversal(pspRef, apiKey, prefix, merchant) {
   const { status, json, error } = await safeRequest("POST", url, body, apiKey);
 
   const result = {
-    probe: "PAL /payments/{pspRef}/reversals (probe)",
+    probe: "Checkout v71 /payments/{pspRef}/reversals (probe)",
     url,
     status,
     error: error || null,
@@ -237,7 +237,70 @@ async function probePALGetPayment(pspRef, apiKey, prefix, merchant) {
   return result;
 }
 
-// ── AGGREGATORE RISULTATI ─────────────────────────────────────────────────────
+// ── PROBE 4: PAL classico /pal/servlet/Payment/v68/adjustAuthorisation ───────
+// Il PAL live ha un hostname separato: {prefix}-pal-live.adyenpayments.com
+// adjustAuthorisation su un pspRef inesistente → 422 "payment not found"
+// su uno esistente → 422 "amount mismatch" o simile (mai 404)
+async function probePALAdjust(pspRef, apiKey, prefix, merchant) {
+  const url = `https://${prefix}-pal-live.adyenpayments.com/pal/servlet/Payment/v68/adjustAuthorisation`;
+  const body = {
+    merchantAccount: merchant,
+    originalReference: pspRef,
+    modificationAmount: { currency: "EUR", value: 0 },
+    reference: "STATUS_PROBE_DO_NOT_PROCESS",
+  };
+
+  const { status, json, error } = await safeRequest("POST", url, body, apiKey);
+
+  const result = {
+    probe: "PAL v68 /adjustAuthorisation (probe hostname corretto)",
+    url,
+    status,
+    error: error || null,
+    found: null,
+    details: null,
+    notes: [],
+  };
+
+  if (error) {
+    result.notes.push(`Errore di rete: ${error}`);
+    return result;
+  }
+
+  const msg = (json?.message || json?.detail || "").toLowerCase();
+
+  if (status === 401) {
+    result.notes.push("API key non valida.");
+    result.found = false;
+  } else if (status === 403) {
+    result.notes.push("Auth OK, manca il ruolo 'Merchant PAL Webservice role'.");
+    result.found = null;
+  } else if (status === 404 || msg.includes("not found") || msg.includes("unknown")) {
+    result.found = false;
+    result.notes.push("pspReference non trovato su questo merchant account (PAL).");
+  } else if (status === 422 || status === 400) {
+    // Se il pspRef non esiste, Adyen dice "Original pspReference is invalid" o "not found"
+    if (msg.includes("invalid") && (msg.includes("original") || msg.includes("psp"))) {
+      result.found = false;
+      result.notes.push("pspReference non valido o non trovato su questo merchant (PAL).");
+      result.details = { message: json?.message, errorCode: json?.errorCode };
+    } else {
+      result.found = true;
+      result.notes.push("pspReference TROVATO sul PAL live. Errore atteso sul payload del probe.");
+      result.details = { message: json?.message, errorCode: json?.errorCode };
+    }
+  } else if (status === 200) {
+    result.found = true;
+    result.notes.push("Modifica accettata (insolito per probe con amount=0).");
+    result.details = json;
+  } else {
+    result.notes.push(`Status inatteso ${status}: ${json?.message || ""}`);
+  }
+
+  return result;
+}
+
+
 function aggregateFindings(pspRef, merchantRef, probes) {
   const foundVotes   = probes.filter(p => p.found === true).length;
   const notFoundVotes = probes.filter(p => p.found === false).length;
@@ -312,14 +375,15 @@ export async function GET(request) {
     }, { status: 400 });
   }
 
-  // Lancia i 3 probe in parallelo
-  const [probe1, probe2, probe3] = await Promise.all([
+  // Lancia i 4 probe in parallelo
+  const [probe1, probe2, probe3, probe4] = await Promise.all([
     probeCheckoutModification(pspRef, apiKey, prefix, merchant),
     probePALReversal(pspRef, apiKey, prefix, merchant),
     probePALGetPayment(pspRef, apiKey, prefix, merchant),
+    probePALAdjust(pspRef, apiKey, prefix, merchant),
   ]);
 
-  const probes = [probe1, probe2, probe3];
+  const probes = [probe1, probe2, probe3, probe4];
   const summary = aggregateFindings(pspRef, merchantRef, probes);
 
   return Response.json({
