@@ -1,6 +1,12 @@
+// app/layout.js
+//
+// Server Component (default). Importa il wrapper client per il SessionProvider.
+
+import AuthSessionProvider from "./session-provider";
+
 export const metadata = {
-  title: "Adyen API Debugger",
-  description: "Debug Adyen live API authentication and connectivity",
+  title: "De'Longhi Group Portal",
+  description: "Accesso riservato ai dipendenti De'Longhi Group",
 };
 
 export default function RootLayout({ children }) {
@@ -12,7 +18,15 @@ export default function RootLayout({ children }) {
           rel="stylesheet"
         />
       </head>
-      <body style={{ margin: 0, padding: 0 }}>{children}</body>
+      <body style={{ margin: 0, padding: 0 }}>
+        {/*
+          ⚠️  AuthSessionProvider è un Client Component.
+              Tutto ciò che è wrappato qui può accedere a useSession().
+        */}
+        <AuthSessionProvider>
+          {children}
+        </AuthSessionProvider>
+      </body>
     </html>
   );
 }
