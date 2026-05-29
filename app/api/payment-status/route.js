@@ -1,17 +1,9 @@
 // app/api/payment-status/route.js
-//
-// Legge lo stato di un pagamento da Firestore.
-// Supporta ricerca per merchantReference o pspReference.
-//
-// Esempi:
-//   GET /api/payment-status?merchantReference=SFKWEU00082245
-//   GET /api/payment-status?pspReference=NZJ656JJ3LHLN3X3
-//   GET /api/payment-status?merchantReference=SFKWEU00082245&history=true
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { db, COLLECTION } from "@/lib/firestore";
+import { getDb, COLLECTION } from "@/lib/firestore";
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
@@ -27,10 +19,17 @@ export async function GET(request) {
     }, { status: 400 });
   }
 
+  const db = getDb();
+  if (!db) {
+    return Response.json({
+      error:   "Database non disponibile",
+      message: "Verifica le variabili GOOGLE_PROJECT_ID, GOOGLE_CLIENT_EMAIL, GOOGLE_PRIVATE_KEY su Vercel.",
+    }, { status: 503 });
+  }
+
   try {
-    // Costruisce la query in base al parametro fornito
-    const field = merchantReference ? "merchantReference" : "pspReference";
-    const value = merchantReference || pspReference;
+    const field    = merchantReference ? "merchantReference" : "pspReference";
+    const value    = merchantReference || pspReference;
 
     const snapshot = await db
       .collection(COLLECTION)
@@ -46,7 +45,6 @@ export async function GET(request) {
       }, { status: 404 });
     }
 
-    // Costruisce la lista eventi
     const events = snapshot.docs.map(doc => {
       const d = doc.data();
       return {
@@ -60,29 +58,24 @@ export async function GET(request) {
         receivedAt:        d.receivedAt?.toDate?.()?.toISOString() || d.receivedAt,
         pspReference:      d.pspReference,
         merchantReference: d.merchantReference,
-        // rawWebhook incluso solo se history=true (evita response pesanti)
         ...(showHistory ? { rawWebhook: d.rawWebhook } : {}),
       };
     });
 
-    // Lo stato più recente è il primo (orderBy desc)
-    const latest = events[0];
-
-    // Determina stato finale leggibile
+    const latest      = events[0];
     const statusLabel = getStatusLabel(latest.status, latest.success);
 
     return Response.json({
-      found:            true,
+      found:             true,
       merchantReference: latest.merchantReference,
-      pspReference:     latest.pspReference,
-      currentStatus:    latest.status,
+      pspReference:      latest.pspReference,
+      currentStatus:     latest.status,
       statusLabel,
-      lastUpdate:       latest.receivedAt,
-      paymentMethod:    latest.paymentMethod,
-      amount:           latest.amount,
-      currency:         latest.currency,
-      totalEvents:      events.length,
-      // Storico completo degli eventi
+      lastUpdate:        latest.receivedAt,
+      paymentMethod:     latest.paymentMethod,
+      amount:            latest.amount,
+      currency:          latest.currency,
+      totalEvents:       events.length,
       ...(showHistory ? { history: events } : { latestEvent: latest }),
     });
 
@@ -95,7 +88,6 @@ export async function GET(request) {
   }
 }
 
-// ── Etichette stato leggibili per la dashboard ────────────────────────────────
 function getStatusLabel(status, success) {
   const labels = {
     "Authorised":          { label: "Autorizzato",        color: "blue"   },
