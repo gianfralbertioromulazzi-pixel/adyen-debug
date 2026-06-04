@@ -1,10 +1,13 @@
 // app/api/webhooks/adyen/route.js
+//
+// Riceve webhook Adyen e salva ogni evento come riga su Google Sheets.
+// Risponde sempre [accepted] — obbligatorio per Adyen.
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { getDb, COLLECTION, deriveStatus } from "@/lib/firestore";
-import { createHmac }                      from "crypto";
+import { appendRow, deriveStatus } from "@/lib/sheets";
+import { createHmac }              from "crypto";
 
 function verifyHmac(item, hmacKey) {
   if (!hmacKey) return true;
@@ -46,7 +49,6 @@ export async function POST(request) {
 
   const items   = body?.notificationItems || [];
   const hmacKey = process.env.ADYEN_WEBHOOK_HMAC_KEY || "";
-  const db      = getDb();
 
   for (const wrapper of items) {
     const item = wrapper?.NotificationRequestItem;
@@ -57,36 +59,41 @@ export async function POST(request) {
       continue;
     }
 
-    const { eventCode, success, pspReference, merchantReference,
-            amount, paymentMethod, eventDate, merchantAccountCode } = item;
+    const {
+      eventCode, success, pspReference, merchantReference,
+      amount, paymentMethod, eventDate, merchantAccountCode,
+    } = item;
 
     const successBool = success === "true" || success === true;
     const status      = deriveStatus(eventCode, successBool);
+    const receivedAt  = new Date().toISOString();
 
-    if (db) {
-      try {
-        const docId = `${pspReference}_${eventCode}`;
-        await db.collection(COLLECTION).doc(docId).set({
-          merchantReference:   merchantReference   || null,
-          pspReference:        pspReference        || null,
-          eventCode:           eventCode           || null,
-          success:             successBool,
-          status,
-          amount:              amount?.value       || null,
-          currency:            amount?.currency    || null,
-          paymentMethod:       paymentMethod       || null,
-          merchantAccount:     merchantAccountCode || null,
-          eventDate:           eventDate           || null,
-          rawWebhook:          item,
-          receivedAt:          new Date(),
-        }, { merge: true });
-      } catch (err) {
-        console.error("[webhook] Errore Firestore:", err.message);
-      }
+    try {
+      // Scrive una riga nel foglio Google Sheets
+      // Ordine colonne: merchantReference, pspReference, eventCode, status,
+      //                 success, amount, currency, paymentMethod,
+      //                 merchantAccount, eventDate, receivedAt
+      await appendRow([
+        merchantReference        || "",
+        pspReference             || "",
+        eventCode                || "",
+        status,
+        String(successBool),
+        String(amount?.value     || ""),
+        amount?.currency         || "",
+        paymentMethod            || "",
+        merchantAccountCode      || "",
+        eventDate                || "",
+        receivedAt,
+      ]);
+
+      console.log(`[webhook] Salvato: ${merchantReference} / ${eventCode} / ${status}`);
+    } catch (err) {
+      console.error("[webhook] Errore Sheets:", err.message);
+      // Non blocchiamo — rispondiamo [accepted] comunque per non far riprovare Adyen
     }
   }
 
-  // Adyen richiede [accepted] obbligatoriamente
   return new Response("[accepted]", {
     status: 200,
     headers: { "Content-Type": "text/plain" },
@@ -96,6 +103,6 @@ export async function POST(request) {
 export async function GET() {
   return Response.json({
     status:   "ok",
-    endpoint: "Adyen webhook receiver attivo",
+    endpoint: "Adyen webhook receiver attivo (Google Sheets)",
   });
 }
