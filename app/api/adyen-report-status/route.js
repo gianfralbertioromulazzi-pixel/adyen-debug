@@ -38,7 +38,7 @@ async function fetchDayReport(merchant, dateStr, apiKey) {
   try {
     const res = await fetch(url, {
       headers: {
-        "Authorization": "Basic " + Buffer.from(`report@Company.${merchant}:${apiKey}`).toString("base64"),
+        "X-API-Key": apiKey,
       },
     });
 
