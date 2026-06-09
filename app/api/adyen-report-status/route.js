@@ -1,25 +1,15 @@
 // app/api/adyen-report-status/route.js
 //
-// Dato un merchantReference e una data ordine, cerca lo stato nei report CSV
-// salvati su Google Drive da Adyen (via webhook REPORT_AVAILABLE).
-//
-// Cerca su tutti i merchant account configurati in parallelo.
-//
-// Uso:
-//   GET /api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29
-//   GET /api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29&merchant=DELONGHI_EU
-//
-// Variabili d'ambiente:
-//   ADYEN_MERCHANT_ACCOUNTS  — lista separata da virgola, es. "DELONGHI_EU,KENWOOD_EU,..."
-//   GOOGLE_CLIENT_EMAIL
-//   GOOGLE_PRIVATE_KEY
+// Ottimizzato per Vercel Free (timeout 10s):
+// - Cerca merchant per merchant, giorno per giorno
+// - Si ferma APPENA trova il merchantReference
+// - Non lancia 672 richieste in parallelo
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const REPORT_DAYS = 8;
+const REPORT_DAYS = 2;
 
-// ── Date range ────────────────────────────────────────────────────────────────
 function getDatesRange(startDateStr) {
   const dates = [];
   const start = new Date(startDateStr + "T00:00:00Z");
@@ -32,7 +22,6 @@ function getDatesRange(startDateStr) {
   return dates;
 }
 
-// ── Google Drive: ottieni access token ───────────────────────────────────────
 async function getGoogleToken() {
   const clientEmail = process.env.GOOGLE_CLIENT_EMAIL || "";
   const privateKey  = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
@@ -84,7 +73,6 @@ async function getGoogleToken() {
   return data.access_token;
 }
 
-// ── Google Drive: cerca file per nome ────────────────────────────────────────
 async function findFileByName(token, filename) {
   const q   = `name='${filename}' and trashed=false`;
   const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`;
@@ -93,7 +81,6 @@ async function findFileByName(token, filename) {
   return data.files?.[0]?.id || null;
 }
 
-// ── Google Drive: scarica contenuto file ─────────────────────────────────────
 async function downloadFromDrive(token, fileId) {
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
@@ -101,13 +88,10 @@ async function downloadFromDrive(token, fileId) {
   return res.text();
 }
 
-// ── Parser CSV ────────────────────────────────────────────────────────────────
 function parseCSV(csv) {
   const lines = csv.split("\n").filter(l => l.trim());
   if (lines.length < 2) return [];
-
   const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
-
   return lines.slice(1).map(line => {
     const values = [];
     let current  = "";
@@ -118,7 +102,6 @@ function parseCSV(csv) {
       current += char;
     }
     values.push(current.trim());
-
     const obj = {};
     headers.forEach((h, i) => { obj[h] = values[i] || ""; });
     return obj;
@@ -144,43 +127,11 @@ function getStatusLabel(eventType) {
   return map[eventType] || { label: eventType || "Sconosciuto", color: "gray" };
 }
 
-// ── Cerca in un singolo merchant + data ──────────────────────────────────────
-async function searchInReport(token, merchant, date, merchantRef) {
-  const filename = `adyen_report_${merchant}_${date}.csv`;
-  const fileId   = await findFileByName(token, filename);
-
-  if (!fileId) return { merchant, date, filename, available: false };
-
-  const csv   = await downloadFromDrive(token, fileId);
-  const rows  = parseCSV(csv);
-  const found = rows.filter(row => getMerchantRef(row) === merchantRef);
-
-  return {
-    merchant,
-    date,
-    filename,
-    available:  true,
-    totalRows:  rows.length,
-    matchFound: found.length,
-    events: found.map(row => ({
-      merchant,
-      date,
-      eventType:     row["Type"]           || row["Record Type"] || row["type"] || "",
-      status:        row["Status"]         || row["status"]      || "",
-      amount:        row["Amount"]         || row["amount"]      || "",
-      currency:      row["Currency"]       || row["currency"]    || "",
-      pspReference:  row["Psp Reference"]  || row["PSP Reference"] || row["pspReference"] || "",
-      paymentMethod: row["Payment Method"] || row["paymentMethod"] || "",
-    })),
-  };
-}
-
-// ── MAIN HANDLER ──────────────────────────────────────────────────────────────
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
-  const merchantRef     = searchParams.get("merchantReference")?.trim();
-  const orderDate       = searchParams.get("date")?.trim();
-  const merchantFilter  = searchParams.get("merchant")?.trim(); // opzionale
+  const merchantRef    = searchParams.get("merchantReference")?.trim();
+  const orderDate      = searchParams.get("date")?.trim();
+  const merchantFilter = searchParams.get("merchant")?.trim();
 
   if (!merchantRef || !orderDate) {
     return Response.json({
@@ -190,16 +141,11 @@ export async function GET(request) {
   }
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(orderDate)) {
-    return Response.json({
-      error: "Formato data non valido — usa YYYY-MM-DD",
-    }, { status: 400 });
+    return Response.json({ error: "Formato data non valido — usa YYYY-MM-DD" }, { status: 400 });
   }
 
-  // Lista merchant da cercare
   const allMerchants = (process.env.ADYEN_MERCHANT_ACCOUNTS || "")
-    .split(",")
-    .map(m => m.trim())
-    .filter(Boolean);
+    .split(",").map(m => m.trim()).filter(Boolean);
 
   if (allMerchants.length === 0) {
     return Response.json({
@@ -208,7 +154,6 @@ export async function GET(request) {
     }, { status: 500 });
   }
 
-  // Se merchant specifico passato come parametro, cerca solo quello
   const merchantsToSearch = merchantFilter
     ? allMerchants.filter(m => m === merchantFilter)
     : allMerchants;
@@ -217,54 +162,77 @@ export async function GET(request) {
   try {
     googleToken = await getGoogleToken();
   } catch (err) {
-    return Response.json({
-      error:   "Errore autenticazione Google",
-      message: err.message,
-    }, { status: 500 });
+    return Response.json({ error: "Errore autenticazione Google", message: err.message }, { status: 500 });
   }
 
-  const dates = getDatesRange(orderDate);
+  const dates        = getDatesRange(orderDate);
+  const checkedFiles = [];
+  let   foundResult  = null;
 
-  // Cerca in tutti i merchant × tutti i giorni — in parallelo
-  const searchTasks = merchantsToSearch.flatMap(merchant =>
-    dates.map(date => searchInReport(googleToken, merchant, date, merchantRef))
-  );
+  // ── Cerca sequenzialmente — si ferma al primo risultato ──────────────────
+  // Strategia: per ogni merchant, cerca tutti i giorni del range.
+  // Se trova il merchantReference, si ferma subito.
+  // Questo limita le chiamate a Drive al minimo necessario.
+  outer:
+  for (const merchant of merchantsToSearch) {
+    for (const date of dates) {
+      const filename = `adyen_report_${merchant}_${date}.csv`;
 
-  const results = await Promise.all(searchTasks);
+      try {
+        const fileId = await findFileByName(googleToken, filename);
 
-  // Raccoglie tutti gli eventi trovati
-  const allEvents = results
-    .filter(r => r.available && r.matchFound > 0)
-    .flatMap(r => r.events);
+        if (!fileId) {
+          checkedFiles.push({ merchant, date, available: false });
+          continue;
+        }
 
-  // Stato più recente
-  const currentEvent = allEvents[allEvents.length - 1] || null;
+        const csv   = await downloadFromDrive(googleToken, fileId);
+        const rows  = parseCSV(csv);
+        const found = rows.filter(row => getMerchantRef(row) === merchantRef);
+
+        checkedFiles.push({ merchant, date, available: true, totalRows: rows.length, matchFound: found.length });
+
+        if (found.length > 0) {
+          // Trovato — raccoglie tutti gli eventi e si ferma
+          foundResult = {
+            merchant,
+            events: found.map(row => ({
+              merchant,
+              date,
+              eventType:     row["Type"]          || row["Record Type"] || row["type"] || "",
+              status:        row["Status"]         || row["status"]      || "",
+              amount:        row["Amount"]         || row["amount"]      || "",
+              currency:      row["Currency"]       || row["currency"]    || "",
+              pspReference:  row["Psp Reference"]  || row["PSP Reference"] || row["pspReference"] || "",
+              paymentMethod: row["Payment Method"] || row["paymentMethod"] || "",
+            })),
+          };
+          break outer; // ← esce da entrambi i loop
+        }
+
+      } catch (err) {
+        checkedFiles.push({ merchant, date, available: false, error: err.message });
+      }
+    }
+  }
+
+  const currentEvent = foundResult?.events?.[foundResult.events.length - 1] || null;
   const statusLabel  = currentEvent
     ? getStatusLabel(currentEvent.eventType || currentEvent.status)
     : null;
 
-  // Summary per debug
-  const reportSummary = results.map(r => ({
-    merchant:   r.merchant,
-    date:       r.date,
-    available:  r.available,
-    matchFound: r.matchFound || 0,
-    totalRows:  r.totalRows  || 0,
-    reason:     r.available ? undefined : "report non ancora ricevuto da Adyen",
-    error:      r.error     || undefined,
-  }));
-
   return Response.json({
     merchantReference: merchantRef,
     orderDate,
-    merchantsSearched: merchantsToSearch,
-    searchRange:       { from: dates[0], to: dates[dates.length - 1], days: dates.length },
-    found:             allEvents.length > 0,
-    foundOnMerchant:   currentEvent?.merchant || null,
-    currentStatus:     currentEvent ? (currentEvent.eventType || currentEvent.status) : null,
+    searchRange:      { from: dates[0], to: dates[dates.length - 1], days: dates.length },
+    found:            !!foundResult,
+    foundOnMerchant:  foundResult?.merchant || null,
+    currentStatus:    currentEvent ? (currentEvent.eventType || currentEvent.status) : null,
     statusLabel,
-    totalEvents:       allEvents.length,
-    events:            allEvents,
-    reportSummary,
+    totalEvents:      foundResult?.events?.length || 0,
+    events:           foundResult?.events         || [],
+    // Debug: quanti file abbiamo controllato prima di trovare/arrenderci
+    filesChecked:     checkedFiles.length,
+    checkedFiles,
   });
 }
