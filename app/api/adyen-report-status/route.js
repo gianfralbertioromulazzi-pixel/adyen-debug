@@ -1,21 +1,13 @@
 // app/api/adyen-report-status/route.js
 //
 // Dato un merchantReference e una data ordine:
-// 1. Scarica il report CSV Adyen per ogni giorno (8 giorni a partire dalla data)
-// 2. Carica il CSV su Google Drive come file temporaneo
-// 3. Filtra per merchantReference
-// 4. Cancella il file da Google Drive
-// 5. Ritorna lo stato trovato
+// 1. Cerca su Google Drive i report CSV del range di 8 giorni
+// 2. Scarica e filtra per merchantReference
+// 3. Cancella i file temporanei usati
+// 4. Ritorna lo stato
 //
 // Uso:
-//   GET /api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29
-//
-// Variabili d'ambiente:
-//   ADYEN_REPORT_USERNAME   — es. "report@Company.DelonghiUS"
-//   ADYEN_REPORT_PASSWORD   — password Basic Auth della credential Report
-//   ADYEN_MERCHANT_ACCOUNT  — es. "DelonghiUS"
-//   GOOGLE_CLIENT_EMAIL     — service account email
-//   GOOGLE_PRIVATE_KEY      — service account private key
+//   GET /api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29&merchant=DELONGHI_EU
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,7 +21,6 @@ function getDatesRange(startDateStr) {
   for (let i = 0; i < REPORT_DAYS; i++) {
     const d = new Date(start);
     d.setUTCDate(d.getUTCDate() + i);
-    // Non includere date future
     if (d > new Date()) break;
     dates.push(d.toISOString().slice(0, 10));
   }
@@ -88,64 +79,20 @@ async function getGoogleToken() {
   return data.access_token;
 }
 
-// ── Google Drive: carica file temporaneo ─────────────────────────────────────
-async function uploadToDrive(token, filename, csvContent) {
-  const metadata = JSON.stringify({ name: filename, mimeType: "text/csv" });
-  const boundary = "boundary_adyen_report";
-
-  const body = [
-    `--${boundary}`,
-    "Content-Type: application/json; charset=UTF-8",
-    "",
-    metadata,
-    `--${boundary}`,
-    "Content-Type: text/csv",
-    "",
-    csvContent,
-    `--${boundary}--`,
-  ].join("\r\n");
-
-  const res = await fetch(
-    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
-    {
-      method:  "POST",
-      headers: {
-        Authorization:  `Bearer ${token}`,
-        "Content-Type": `multipart/related; boundary=${boundary}`,
-      },
-      body,
-    }
-  );
-
+// ── Google Drive: cerca file per nome ────────────────────────────────────────
+async function findFileByName(token, filename) {
+  const q   = `name='${filename}' and trashed=false`;
+  const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   const data = await res.json();
-  if (!data.id) throw new Error(`Drive upload error: ${JSON.stringify(data)}`);
-  return data.id;
+  return data.files?.[0]?.id || null;
 }
 
-// ── Google Drive: cancella file ───────────────────────────────────────────────
-async function deleteFromDrive(token, fileId) {
-  await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
-    method:  "DELETE",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
-// ── Scarica report CSV da Adyen ───────────────────────────────────────────────
-async function downloadReport(merchant, dateStr, username, password) {
-  const dateFmt = dateStr.replace(/-/g, "_");
-  const url     = `https://ca-live.adyen.com/reports/download/MerchantAccount/${merchant}/payments_accounting_report_${dateFmt}.csv`;
-  const auth    = Buffer.from(`${username}:${password}`).toString("base64");
-
-  const res = await fetch(url, {
-    headers: { Authorization: `Basic ${auth}` },
-  });
-
-  if (res.status === 404) return null; // report non ancora disponibile
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HTTP ${res.status} per ${dateStr}: ${text.slice(0, 200)}`);
-  }
-
+// ── Google Drive: scarica contenuto file ─────────────────────────────────────
+async function downloadFromDrive(token, fileId) {
+  const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Drive download error: HTTP ${res.status}`);
   return res.text();
 }
 
@@ -180,14 +127,14 @@ function getMerchantRef(row) {
 
 function getStatusLabel(eventType) {
   const map = {
-    "Authorised":       { label: "Autorizzato",     color: "blue"   },
-    "Settled":          { label: "Incassato",        color: "green"  },
-    "SentForSettle":    { label: "In liquidazione",  color: "cyan"   },
-    "Refused":          { label: "Rifiutato",        color: "red"    },
-    "Cancelled":        { label: "Annullato",        color: "gray"   },
-    "Refunded":         { label: "Rimborsato",       color: "orange" },
-    "Chargeback":       { label: "Chargeback",       color: "red"    },
-    "Error":            { label: "Errore",           color: "red"    },
+    "Authorised":    { label: "Autorizzato",    color: "blue"   },
+    "Settled":       { label: "Incassato",       color: "green"  },
+    "SentForSettle": { label: "In liquidazione", color: "cyan"   },
+    "Refused":       { label: "Rifiutato",       color: "red"    },
+    "Cancelled":     { label: "Annullato",       color: "gray"   },
+    "Refunded":      { label: "Rimborsato",      color: "orange" },
+    "Chargeback":    { label: "Chargeback",      color: "red"    },
+    "Error":         { label: "Errore",          color: "red"    },
   };
   return map[eventType] || { label: eventType || "Sconosciuto", color: "gray" };
 }
@@ -197,101 +144,82 @@ export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const merchantRef = searchParams.get("merchantReference")?.trim();
   const orderDate   = searchParams.get("date")?.trim();
+  const merchant    = searchParams.get("merchant")?.trim()
+                   || process.env.ADYEN_MERCHANT_ACCOUNT
+                   || "";
 
   if (!merchantRef || !orderDate) {
     return Response.json({
       error:   "Parametri mancanti",
-      example: "/api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29",
+      example: "/api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29&merchant=DELONGHI_EU",
     }, { status: 400 });
   }
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(orderDate)) {
     return Response.json({
-      error:   "Formato data non valido",
-      message: "Usa il formato YYYY-MM-DD",
+      error:   "Formato data non valido — usa YYYY-MM-DD",
     }, { status: 400 });
   }
 
-  const username = process.env.ADYEN_REPORT_USERNAME  || "";
-  const password = process.env.ADYEN_REPORT_PASSWORD  || "";
-  const merchant = process.env.ADYEN_MERCHANT_ACCOUNT || "";
-
-  if (!username || !password || !merchant) {
+  let googleToken;
+  try {
+    googleToken = await getGoogleToken();
+  } catch (err) {
     return Response.json({
-      error:  "Variabili d'ambiente mancanti",
-      needed: ["ADYEN_REPORT_USERNAME", "ADYEN_REPORT_PASSWORD", "ADYEN_MERCHANT_ACCOUNT"],
+      error:   "Errore autenticazione Google Drive",
+      message: err.message,
     }, { status: 500 });
   }
 
   const dates          = getDatesRange(orderDate);
   const matchingEvents = [];
   const reportSummary  = [];
-  let   googleToken    = null;
-
-  // Ottieni token Google una volta sola
-  try {
-    googleToken = await getGoogleToken();
-  } catch (err) {
-    console.warn("[report] Google Drive non disponibile:", err.message);
-  }
 
   for (const date of dates) {
-    let driveFileId = null;
-    try {
-      // 1. Scarica CSV da Adyen
-      const csv = await downloadReport(merchant, date, username, password);
+    const filename = `adyen_report_${merchant}_${date}.csv`;
 
-      if (!csv) {
-        reportSummary.push({ date, available: false, reason: "report non ancora generato" });
+    try {
+      // Cerca il file su Drive
+      const fileId = await findFileByName(googleToken, filename);
+
+      if (!fileId) {
+        reportSummary.push({ date, filename, available: false, reason: "report non ancora ricevuto da Adyen" });
         continue;
       }
 
-      // 2. Carica su Google Drive (temporaneo)
-      if (googleToken) {
-        const filename = `adyen_temp_${merchant}_${date}_${Date.now()}.csv`;
-        driveFileId    = await uploadToDrive(googleToken, filename, csv);
-      }
+      // Scarica e parsa il CSV
+      const csv  = await downloadFromDrive(googleToken, fileId);
+      const rows = parseCSV(csv);
 
-      // 3. Parsa e filtra per merchantReference
-      const rows   = parseCSV(csv);
-      const found  = rows.filter(row => getMerchantRef(row) === merchantRef);
+      // Filtra per merchantReference
+      const found = rows.filter(row => getMerchantRef(row) === merchantRef);
 
       found.forEach(row => {
-        const eventType = row["Type"] || row["type"] || row["Event"] || row["Record Type"] || "";
+        const eventType = row["Type"] || row["Record Type"] || row["type"] || "";
         matchingEvents.push({
           date,
           eventType,
-          status:        row["Status"]         || row["status"]        || "",
-          amount:        row["Amount"]          || row["amount"]        || "",
-          currency:      row["Currency"]        || row["currency"]      || "",
-          pspReference:  row["Psp Reference"]   || row["pspReference"]  || row["PSP Reference"] || "",
-          paymentMethod: row["Payment Method"]  || row["paymentMethod"] || "",
+          status:        row["Status"]        || row["status"]        || "",
+          amount:        row["Amount"]         || row["amount"]        || "",
+          currency:      row["Currency"]       || row["currency"]      || "",
+          pspReference:  row["Psp Reference"]  || row["PSP Reference"] || row["pspReference"] || "",
+          paymentMethod: row["Payment Method"] || row["paymentMethod"] || "",
         });
       });
 
       reportSummary.push({
         date,
+        filename,
         available:  true,
         totalRows:  rows.length,
-        matchFound: found.length > 0,
-        driveFileId,
+        matchFound: found.length,
       });
 
     } catch (err) {
-      reportSummary.push({ date, available: false, error: err.message });
-    } finally {
-      // 4. Cancella il file da Google Drive
-      if (googleToken && driveFileId) {
-        try {
-          await deleteFromDrive(googleToken, driveFileId);
-        } catch (err) {
-          console.warn("[report] Errore cancellazione Drive:", err.message);
-        }
-      }
+      reportSummary.push({ date, filename, available: false, error: err.message });
     }
   }
 
-  // Stato più recente = ultimo evento trovato
   const currentEvent = matchingEvents[matchingEvents.length - 1] || null;
   const statusLabel  = currentEvent
     ? getStatusLabel(currentEvent.eventType || currentEvent.status)
@@ -299,9 +227,10 @@ export async function GET(request) {
 
   return Response.json({
     merchantReference: merchantRef,
+    merchant,
     orderDate,
-    searchRange: { from: dates[0], to: dates[dates.length - 1], days: dates.length },
-    found:       matchingEvents.length > 0,
+    searchRange:   { from: dates[0], to: dates[dates.length - 1], days: dates.length },
+    found:         matchingEvents.length > 0,
     currentStatus: currentEvent ? (currentEvent.eventType || currentEvent.status) : null,
     statusLabel,
     totalEvents:   matchingEvents.length,
