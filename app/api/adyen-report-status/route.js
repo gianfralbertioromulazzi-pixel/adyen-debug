@@ -1,13 +1,18 @@
 // app/api/adyen-report-status/route.js
 //
-// Dato un merchantReference e una data ordine:
-// 1. Cerca su Google Drive i report CSV del range di 8 giorni
-// 2. Scarica e filtra per merchantReference
-// 3. Cancella i file temporanei usati
-// 4. Ritorna lo stato
+// Dato un merchantReference e una data ordine, cerca lo stato nei report CSV
+// salvati su Google Drive da Adyen (via webhook REPORT_AVAILABLE).
+//
+// Cerca su tutti i merchant account configurati in parallelo.
 //
 // Uso:
+//   GET /api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29
 //   GET /api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29&merchant=DELONGHI_EU
+//
+// Variabili d'ambiente:
+//   ADYEN_MERCHANT_ACCOUNTS  — lista separata da virgola, es. "DELONGHI_EU,KENWOOD_EU,..."
+//   GOOGLE_CLIENT_EMAIL
+//   GOOGLE_PRIVATE_KEY
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -65,7 +70,7 @@ async function getGoogleToken() {
 
   const jwt = `${signing}.${Buffer.from(signature).toString("base64url")}`;
 
-  const res  = await fetch("https://oauth2.googleapis.com/token", {
+  const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -139,102 +144,127 @@ function getStatusLabel(eventType) {
   return map[eventType] || { label: eventType || "Sconosciuto", color: "gray" };
 }
 
+// ── Cerca in un singolo merchant + data ──────────────────────────────────────
+async function searchInReport(token, merchant, date, merchantRef) {
+  const filename = `adyen_report_${merchant}_${date}.csv`;
+  const fileId   = await findFileByName(token, filename);
+
+  if (!fileId) return { merchant, date, filename, available: false };
+
+  const csv   = await downloadFromDrive(token, fileId);
+  const rows  = parseCSV(csv);
+  const found = rows.filter(row => getMerchantRef(row) === merchantRef);
+
+  return {
+    merchant,
+    date,
+    filename,
+    available:  true,
+    totalRows:  rows.length,
+    matchFound: found.length,
+    events: found.map(row => ({
+      merchant,
+      date,
+      eventType:     row["Type"]           || row["Record Type"] || row["type"] || "",
+      status:        row["Status"]         || row["status"]      || "",
+      amount:        row["Amount"]         || row["amount"]      || "",
+      currency:      row["Currency"]       || row["currency"]    || "",
+      pspReference:  row["Psp Reference"]  || row["PSP Reference"] || row["pspReference"] || "",
+      paymentMethod: row["Payment Method"] || row["paymentMethod"] || "",
+    })),
+  };
+}
+
 // ── MAIN HANDLER ──────────────────────────────────────────────────────────────
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
-  const merchantRef = searchParams.get("merchantReference")?.trim();
-  const orderDate   = searchParams.get("date")?.trim();
-  const merchant    = searchParams.get("merchant")?.trim()
-                   || process.env.ADYEN_MERCHANT_ACCOUNT
-                   || "";
+  const merchantRef     = searchParams.get("merchantReference")?.trim();
+  const orderDate       = searchParams.get("date")?.trim();
+  const merchantFilter  = searchParams.get("merchant")?.trim(); // opzionale
 
   if (!merchantRef || !orderDate) {
     return Response.json({
       error:   "Parametri mancanti",
-      example: "/api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29&merchant=DELONGHI_EU",
+      example: "/api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29",
     }, { status: 400 });
   }
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(orderDate)) {
     return Response.json({
-      error:   "Formato data non valido — usa YYYY-MM-DD",
+      error: "Formato data non valido — usa YYYY-MM-DD",
     }, { status: 400 });
   }
+
+  // Lista merchant da cercare
+  const allMerchants = (process.env.ADYEN_MERCHANT_ACCOUNTS || "")
+    .split(",")
+    .map(m => m.trim())
+    .filter(Boolean);
+
+  if (allMerchants.length === 0) {
+    return Response.json({
+      error:   "ADYEN_MERCHANT_ACCOUNTS non configurato",
+      message: "Aggiungi su Vercel: ADYEN_MERCHANT_ACCOUNTS=DELONGHI_EU,KENWOOD_EU,...",
+    }, { status: 500 });
+  }
+
+  // Se merchant specifico passato come parametro, cerca solo quello
+  const merchantsToSearch = merchantFilter
+    ? allMerchants.filter(m => m === merchantFilter)
+    : allMerchants;
 
   let googleToken;
   try {
     googleToken = await getGoogleToken();
   } catch (err) {
     return Response.json({
-      error:   "Errore autenticazione Google Drive",
+      error:   "Errore autenticazione Google",
       message: err.message,
     }, { status: 500 });
   }
 
-  const dates          = getDatesRange(orderDate);
-  const matchingEvents = [];
-  const reportSummary  = [];
+  const dates = getDatesRange(orderDate);
 
-  for (const date of dates) {
-    const filename = `adyen_report_${merchant}_${date}.csv`;
+  // Cerca in tutti i merchant × tutti i giorni — in parallelo
+  const searchTasks = merchantsToSearch.flatMap(merchant =>
+    dates.map(date => searchInReport(googleToken, merchant, date, merchantRef))
+  );
 
-    try {
-      // Cerca il file su Drive
-      const fileId = await findFileByName(googleToken, filename);
+  const results = await Promise.all(searchTasks);
 
-      if (!fileId) {
-        reportSummary.push({ date, filename, available: false, reason: "report non ancora ricevuto da Adyen" });
-        continue;
-      }
+  // Raccoglie tutti gli eventi trovati
+  const allEvents = results
+    .filter(r => r.available && r.matchFound > 0)
+    .flatMap(r => r.events);
 
-      // Scarica e parsa il CSV
-      const csv  = await downloadFromDrive(googleToken, fileId);
-      const rows = parseCSV(csv);
-
-      // Filtra per merchantReference
-      const found = rows.filter(row => getMerchantRef(row) === merchantRef);
-
-      found.forEach(row => {
-        const eventType = row["Type"] || row["Record Type"] || row["type"] || "";
-        matchingEvents.push({
-          date,
-          eventType,
-          status:        row["Status"]        || row["status"]        || "",
-          amount:        row["Amount"]         || row["amount"]        || "",
-          currency:      row["Currency"]       || row["currency"]      || "",
-          pspReference:  row["Psp Reference"]  || row["PSP Reference"] || row["pspReference"] || "",
-          paymentMethod: row["Payment Method"] || row["paymentMethod"] || "",
-        });
-      });
-
-      reportSummary.push({
-        date,
-        filename,
-        available:  true,
-        totalRows:  rows.length,
-        matchFound: found.length,
-      });
-
-    } catch (err) {
-      reportSummary.push({ date, filename, available: false, error: err.message });
-    }
-  }
-
-  const currentEvent = matchingEvents[matchingEvents.length - 1] || null;
+  // Stato più recente
+  const currentEvent = allEvents[allEvents.length - 1] || null;
   const statusLabel  = currentEvent
     ? getStatusLabel(currentEvent.eventType || currentEvent.status)
     : null;
 
+  // Summary per debug
+  const reportSummary = results.map(r => ({
+    merchant:   r.merchant,
+    date:       r.date,
+    available:  r.available,
+    matchFound: r.matchFound || 0,
+    totalRows:  r.totalRows  || 0,
+    reason:     r.available ? undefined : "report non ancora ricevuto da Adyen",
+    error:      r.error     || undefined,
+  }));
+
   return Response.json({
     merchantReference: merchantRef,
-    merchant,
     orderDate,
-    searchRange:   { from: dates[0], to: dates[dates.length - 1], days: dates.length },
-    found:         matchingEvents.length > 0,
-    currentStatus: currentEvent ? (currentEvent.eventType || currentEvent.status) : null,
+    merchantsSearched: merchantsToSearch,
+    searchRange:       { from: dates[0], to: dates[dates.length - 1], days: dates.length },
+    found:             allEvents.length > 0,
+    foundOnMerchant:   currentEvent?.merchant || null,
+    currentStatus:     currentEvent ? (currentEvent.eventType || currentEvent.status) : null,
     statusLabel,
-    totalEvents:   matchingEvents.length,
-    events:        matchingEvents,
+    totalEvents:       allEvents.length,
+    events:            allEvents,
     reportSummary,
   });
 }
