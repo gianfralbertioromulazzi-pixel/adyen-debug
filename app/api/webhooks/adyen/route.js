@@ -1,15 +1,24 @@
 // app/api/webhooks/adyen/route.js
 //
-// Riceve webhook REPORT_AVAILABLE da Adyen:
-// 1. Scarica il CSV dall'URL nel campo "reason"
-// 2. Salva su Google Drive
-// In caso di errore, logga l'URL su Google Sheets per debug
+// Riceve webhook REPORT_AVAILABLE da Adyen.
+// Gestisce SOLO i report che ci interessano per il monitoring stati pagamento:
+//   - received_payments_report  (arriva regolarmente — fonte primaria)
+//   - payments_accounting_report (se Adyen inizia a mandarlo — fonte secondaria)
+//
+// Scarica il CSV dall'URL nel campo "reason" e lo salva su Google Drive.
+// In caso di errore, logga l'URL su Google Sheets per debug.
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { createHmac } from "crypto";
 import { appendRow }  from "@/lib/sheets";
+
+// Report che vogliamo intercettare — il nome file (pspReference) li identifica
+const RELEVANT_REPORT_PREFIXES = [
+  "received_payments_report",
+  "payments_accounting_report",
+];
 
 function verifyHmac(item, hmacKey) {
   if (!hmacKey) return true;
@@ -105,6 +114,14 @@ async function downloadReportFromUrl(reportUrl, username, password) {
   return res.text();
 }
 
+// Identifica il TIPO di report dal nome file (pspReference contiene il filename)
+function getReportType(pspReference) {
+  for (const prefix of RELEVANT_REPORT_PREFIXES) {
+    if (pspReference?.startsWith(prefix)) return prefix;
+  }
+  return null;
+}
+
 function extractDateFromFilename(pspReference) {
   const match = pspReference?.match(/(\d{4}_\d{2}_\d{2})/);
   return match ? match[1].replace(/_/g, "-") : new Date().toISOString().slice(0, 10);
@@ -133,6 +150,13 @@ export async function POST(request) {
     const merchantCode = item.merchantAccountCode || "";
     const pspReference = item.pspReference || "";
 
+    // Filtra solo i report che ci interessano — ignora settlement, dispute, ecc.
+    const reportType = getReportType(pspReference);
+    if (!reportType) {
+      console.log(`[webhook] Report ignorato (non rilevante): ${pspReference}`);
+      continue;
+    }
+
     if (!reportUrl) {
       console.warn("[webhook] REPORT_AVAILABLE senza URL in reason");
       continue;
@@ -147,25 +171,37 @@ export async function POST(request) {
     }
 
     try {
-      console.log(`[webhook] Scarico report: ${reportUrl}`);
+      console.log(`[webhook] Scarico ${reportType}: ${reportUrl}`);
       const csv         = await downloadReportFromUrl(reportUrl, username, password);
       const reportDate  = extractDateFromFilename(pspReference);
-      const filename    = `adyen_report_${merchantCode}_${reportDate}.csv`;
+      // Nome file su Drive: adyen_received_DELONGHI_EU_2026-06-23.csv
+      const shortType   = reportType === "received_payments_report" ? "received" : "accounting";
+      const filename     = `adyen_${shortType}_${merchantCode}_${reportDate}.csv`;
       const googleToken = await getGoogleToken();
       const fileId      = await uploadToDrive(googleToken, filename, csv);
       console.log(`[webhook] Salvato su Drive: ${filename} (${fileId})`);
 
+      // Log successo su Sheets (utile per monitorare la pipeline)
+      try {
+        await appendRow([
+          new Date().toISOString(),
+          "REPORT_SAVED",
+          merchantCode,
+          reportType,
+          filename,
+          "ok",
+        ]);
+      } catch {}
+
     } catch (err) {
       console.error("[webhook] Errore:", err.message);
-
-      // Logga su Sheets per debug — così vediamo l'URL esatto che Adyen ha mandato
       try {
         await appendRow([
           new Date().toISOString(),
           "REPORT_AVAILABLE_ERROR",
           merchantCode,
           pspReference,
-          reportUrl,      // ← URL esatto di Adyen — fondamentale per debug
+          reportUrl,
           err.message,
         ]);
       } catch (logErr) {
@@ -184,6 +220,6 @@ export async function GET() {
   return Response.json({
     status:   "ok",
     endpoint: "Adyen webhook receiver attivo",
-    handles:  ["REPORT_AVAILABLE"],
+    handles:  RELEVANT_REPORT_PREFIXES,
   });
 }
