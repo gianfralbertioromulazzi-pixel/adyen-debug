@@ -1,9 +1,13 @@
 // app/api/adyen-report-status/route.js
 //
-// Ottimizzato per Vercel Free (timeout 10s):
-// - Cerca merchant per merchant, giorno per giorno
-// - Si ferma APPENA trova il merchantReference
-// - Non lancia 672 richieste in parallelo
+// Dato un merchantReference e una data ordine, cerca lo stato nel report
+// "received_payments_report" salvato su Google Drive (via webhook REPORT_AVAILABLE).
+//
+// Ottimizzato per Vercel Free: cerca merchant per merchant, giorno per giorno,
+// si ferma al primo risultato trovato.
+//
+// Uso:
+//   GET /api/adyen-report-status?merchantReference=SFDLEU00435249&date=2026-05-29
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,49 +29,33 @@ function getDatesRange(startDateStr) {
 async function getGoogleToken() {
   const clientEmail = process.env.GOOGLE_CLIENT_EMAIL || "";
   const privateKey  = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
-
   const now     = Math.floor(Date.now() / 1000);
   const payload = {
-    iss:   clientEmail,
-    scope: "https://www.googleapis.com/auth/drive.file",
-    aud:   "https://oauth2.googleapis.com/token",
-    iat:   now,
-    exp:   now + 3600,
+    iss: clientEmail, scope: "https://www.googleapis.com/auth/drive.file",
+    aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600,
   };
-
   const b64     = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
   const signing = `${b64({ alg: "RS256", typ: "JWT" })}.${b64(payload)}`;
-
   const keyData = privateKey
     .replace("-----BEGIN PRIVATE KEY-----", "")
     .replace("-----END PRIVATE KEY-----", "")
     .replace(/\s/g, "");
-
   const cryptoKey = await globalThis.crypto.subtle.importKey(
-    "pkcs8",
-    Buffer.from(keyData, "base64"),
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
+    "pkcs8", Buffer.from(keyData, "base64"),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]
   );
-
   const signature = await globalThis.crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    Buffer.from(signing)
+    "RSASSA-PKCS1-v1_5", cryptoKey, Buffer.from(signing)
   );
-
   const jwt = `${signing}.${Buffer.from(signature).toString("base64url")}`;
-
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion:  jwt,
+      assertion: jwt,
     }),
   });
-
   const data = await res.json();
   if (!data.access_token) throw new Error(`Google token error: ${JSON.stringify(data)}`);
   return data.access_token;
@@ -108,12 +96,13 @@ function parseCSV(csv) {
   });
 }
 
+// Il received_payments_report usa "Merchant Reference" come colonna standard
 function getMerchantRef(row) {
   return row["Merchant Reference"] || row["merchant_reference"] ||
          row["merchantReference"]  || row["Merchant reference"] || "";
 }
 
-function getStatusLabel(eventType) {
+function getStatusLabel(status) {
   const map = {
     "Authorised":    { label: "Autorizzato",    color: "blue"   },
     "Settled":       { label: "Incassato",       color: "green"  },
@@ -124,7 +113,7 @@ function getStatusLabel(eventType) {
     "Chargeback":    { label: "Chargeback",      color: "red"    },
     "Error":         { label: "Errore",          color: "red"    },
   };
-  return map[eventType] || { label: eventType || "Sconosciuto", color: "gray" };
+  return map[status] || { label: status || "Sconosciuto", color: "gray" };
 }
 
 export async function GET(request) {
@@ -169,20 +158,17 @@ export async function GET(request) {
   const checkedFiles = [];
   let   foundResult  = null;
 
-  // ── Cerca sequenzialmente — si ferma al primo risultato ──────────────────
-  // Strategia: per ogni merchant, cerca tutti i giorni del range.
-  // Se trova il merchantReference, si ferma subito.
-  // Questo limita le chiamate a Drive al minimo necessario.
   outer:
   for (const merchant of merchantsToSearch) {
     for (const date of dates) {
-      const filename = `adyen_report_${merchant}_${date}.csv`;
+      // Nome file aggiornato: adyen_received_{merchant}_{date}.csv
+      const filename = `adyen_received_${merchant}_${date}.csv`;
 
       try {
         const fileId = await findFileByName(googleToken, filename);
 
         if (!fileId) {
-          checkedFiles.push({ merchant, date, available: false });
+          checkedFiles.push({ merchant, date, filename, available: false });
           continue;
         }
 
@@ -190,49 +176,45 @@ export async function GET(request) {
         const rows  = parseCSV(csv);
         const found = rows.filter(row => getMerchantRef(row) === merchantRef);
 
-        checkedFiles.push({ merchant, date, available: true, totalRows: rows.length, matchFound: found.length });
+        checkedFiles.push({ merchant, date, filename, available: true, totalRows: rows.length, matchFound: found.length });
 
         if (found.length > 0) {
-          // Trovato — raccoglie tutti gli eventi e si ferma
           foundResult = {
             merchant,
             events: found.map(row => ({
               merchant,
               date,
-              eventType:     row["Type"]          || row["Record Type"] || row["type"] || "",
               status:        row["Status"]         || row["status"]      || "",
-              amount:        row["Amount"]         || row["amount"]      || "",
-              currency:      row["Currency"]       || row["currency"]    || "",
-              pspReference:  row["Psp Reference"]  || row["PSP Reference"] || row["pspReference"] || "",
-              paymentMethod: row["Payment Method"] || row["paymentMethod"] || "",
+              amount:        row["Amount"]          || row["amount"]      || "",
+              currency:      row["Currency"]        || row["currency"]    || "",
+              pspReference:  row["Psp Reference"]   || row["PSP Reference"] || row["pspReference"] || "",
+              paymentMethod: row["Payment Method"]  || row["paymentMethod"] || "",
+              creationDate:  row["Creation Date"]   || row["creationDate"] || "",
             })),
           };
-          break outer; // ← esce da entrambi i loop
+          break outer;
         }
 
       } catch (err) {
-        checkedFiles.push({ merchant, date, available: false, error: err.message });
+        checkedFiles.push({ merchant, date, filename, available: false, error: err.message });
       }
     }
   }
 
   const currentEvent = foundResult?.events?.[foundResult.events.length - 1] || null;
-  const statusLabel  = currentEvent
-    ? getStatusLabel(currentEvent.eventType || currentEvent.status)
-    : null;
+  const statusLabel  = currentEvent ? getStatusLabel(currentEvent.status) : null;
 
   return Response.json({
     merchantReference: merchantRef,
     orderDate,
-    searchRange:      { from: dates[0], to: dates[dates.length - 1], days: dates.length },
-    found:            !!foundResult,
-    foundOnMerchant:  foundResult?.merchant || null,
-    currentStatus:    currentEvent ? (currentEvent.eventType || currentEvent.status) : null,
+    searchRange:     { from: dates[0], to: dates[dates.length - 1], days: dates.length },
+    found:           !!foundResult,
+    foundOnMerchant: foundResult?.merchant || null,
+    currentStatus:   currentEvent?.status || null,
     statusLabel,
-    totalEvents:      foundResult?.events?.length || 0,
-    events:           foundResult?.events         || [],
-    // Debug: quanti file abbiamo controllato prima di trovare/arrenderci
-    filesChecked:     checkedFiles.length,
+    totalEvents:     foundResult?.events?.length || 0,
+    events:          foundResult?.events         || [],
+    filesChecked:    checkedFiles.length,
     checkedFiles,
   });
 }
