@@ -1,11 +1,11 @@
 // app/api/report-manual-download/route.js
 // ⚠️  TEMPORANEO — rimuovi dopo il test
 //
-// Scarica manualmente i report Adyen del giorno specificato
-// per tutti i merchant e li salva su Google Drive.
+// Scarica manualmente il "received_payments_report" del giorno specificato
+// per tutti i merchant configurati e li salva su Google Drive.
 //
 // Uso:
-//   GET /api/report-manual-download?date=2026-06-09
+//   GET /api/report-manual-download?date=2026-06-23
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,11 +15,8 @@ async function getGoogleToken() {
   const privateKey  = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
   const now         = Math.floor(Date.now() / 1000);
   const payload     = {
-    iss:   clientEmail,
-    scope: "https://www.googleapis.com/auth/drive.file",
-    aud:   "https://oauth2.googleapis.com/token",
-    iat:   now,
-    exp:   now + 3600,
+    iss: clientEmail, scope: "https://www.googleapis.com/auth/drive.file",
+    aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600,
   };
   const b64     = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
   const signing = `${b64({ alg: "RS256", typ: "JWT" })}.${b64(payload)}`;
@@ -40,7 +37,7 @@ async function getGoogleToken() {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion:  jwt,
+      assertion: jwt,
     }),
   });
   const data = await res.json();
@@ -60,27 +57,16 @@ async function uploadToDrive(token, filename, csvContent) {
   const boundary = "boundary_adyen_report";
   const metadata = JSON.stringify({ name: filename, mimeType: "text/csv" });
   const body = [
-    `--${boundary}`,
-    "Content-Type: application/json; charset=UTF-8",
-    "", metadata,
-    `--${boundary}`,
-    "Content-Type: text/csv",
-    "", csvContent,
-    `--${boundary}--`,
+    `--${boundary}`, "Content-Type: application/json; charset=UTF-8", "", metadata,
+    `--${boundary}`, "Content-Type: text/csv", "", csvContent, `--${boundary}--`,
   ].join("\r\n");
-
   const existingId = await findFileByName(token, filename);
   const url    = existingId
     ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart`
     : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-  const method = existingId ? "PATCH" : "POST";
-
   const res  = await fetch(url, {
-    method,
-    headers: {
-      Authorization:  `Bearer ${token}`,
-      "Content-Type": `multipart/related; boundary=${boundary}`,
-    },
+    method: existingId ? "PATCH" : "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": `multipart/related; boundary=${boundary}` },
     body,
   });
   const data = await res.json();
@@ -90,13 +76,19 @@ async function uploadToDrive(token, filename, csvContent) {
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
-  const date     = searchParams.get("date")?.trim() || "2026-06-09";
-  const dateFmt  = date.replace(/-/g, "_");
+  const date     = searchParams.get("date")?.trim();
+  const merchant = searchParams.get("merchant")?.trim();
 
-  const username  = process.env.ADYEN_REPORT_USERNAME  || "";
-  const password  = process.env.ADYEN_REPORT_PASSWORD  || "";
-  const merchants = (process.env.ADYEN_MERCHANT_ACCOUNTS || "")
-    .split(",").map(m => m.trim()).filter(Boolean);
+  if (!date || !merchant) {
+    return Response.json({
+      error:   "Parametri mancanti",
+      example: "/api/report-manual-download?date=2026-06-23&merchant=DELONGHI_EU",
+    }, { status: 400 });
+  }
+
+  const dateFmt  = date.replace(/-/g, "_");
+  const username = process.env.ADYEN_REPORT_USERNAME || "";
+  const password = process.env.ADYEN_REPORT_PASSWORD || "";
 
   if (!username || !password) {
     return Response.json({ error: "ADYEN_REPORT_USERNAME o ADYEN_REPORT_PASSWORD mancanti" }, { status: 500 });
@@ -104,49 +96,43 @@ export async function GET(request) {
 
   const auth = Buffer.from(`${username}:${password}`).toString("base64");
 
-  let googleToken;
+  // Proviamo il path "received payment details" — nome file visto nei log Adyen
+  const url = `https://ca-live.adyen.com/reports/download/MerchantAccount/${merchant}/received_payments_report_${dateFmt}.csv`;
+
+  let result;
   try {
-    googleToken = await getGoogleToken();
-  } catch (err) {
-    return Response.json({ error: "Errore Google token", message: err.message }, { status: 500 });
-  }
+    const res = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
 
-  const results = [];
+    if (res.status === 404) {
+      result = { status: "not_found", url, reason: "report non disponibile per questa data/merchant" };
+    } else if (!res.ok) {
+      const text = await res.text();
+      result = { status: "error", url, reason: `HTTP ${res.status}`, preview: text.slice(0, 300) };
+    } else {
+      const csv = await res.text();
+      const rows = csv.split("\n").filter(l => l.trim());
 
-  // Processa un merchant alla volta per non andare in timeout
-  for (const merchant of merchants) {
-    const url      = `https://ca-live.adyen.com/reports/download/MerchantAccount/${merchant}/payments_accounting_report_${dateFmt}.csv`;
-    const filename = `adyen_report_${merchant}_${date}.csv`;
-
-    try {
-      const res = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
-
-      if (res.status === 404) {
-        results.push({ merchant, status: "not_found", reason: "report non disponibile per questa data" });
-        continue;
+      let googleToken, fileId;
+      try {
+        googleToken = await getGoogleToken();
+        const filename = `adyen_received_${merchant}_${date}.csv`;
+        fileId = await uploadToDrive(googleToken, filename, csv);
+        result = {
+          status: "saved",
+          url,
+          filename,
+          fileId,
+          totalRows: rows.length - 1,
+          headerPreview: rows[0],
+          firstDataRow: rows[1] || null,
+        };
+      } catch (driveErr) {
+        result = { status: "downloaded_but_drive_failed", url, error: driveErr.message, totalRows: rows.length - 1 };
       }
-
-      if (!res.ok) {
-        results.push({ merchant, status: "error", reason: `HTTP ${res.status}` });
-        continue;
-      }
-
-      const csv    = await res.text();
-      const fileId = await uploadToDrive(googleToken, filename, csv);
-      results.push({ merchant, status: "saved", filename, fileId });
-
-    } catch (err) {
-      results.push({ merchant, status: "error", reason: err.message });
     }
+  } catch (err) {
+    result = { status: "error", url, reason: err.message };
   }
 
-  const saved    = results.filter(r => r.status === "saved").length;
-  const notFound = results.filter(r => r.status === "not_found").length;
-  const errors   = results.filter(r => r.status === "error").length;
-
-  return Response.json({
-    date,
-    summary: { total: merchants.length, saved, notFound, errors },
-    results,
-  });
+  return Response.json({ date, merchant, result });
 }
